@@ -228,6 +228,26 @@ describe('getScheduleRunProject (occurrence scope, recorded vs unknown)', () => 
    * if that ever stopped holding, a deliberately unscoped run would silently start
    * being validated against the schedule's current project instead.
    */
+  it("narrows the user's in-flight runs to the statuses asked for", async () => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const generating = new Date('2026-07-22T12:00:00Z');
+    const paused = new Date('2026-07-23T12:00:00Z');
+    await methods.reserveStartedRun(runData(schedule, { scheduledFor: paused }));
+    await methods.recordRunOutcome({
+      scheduleId: schedule.id,
+      scheduledFor: paused,
+      status: 'requires_action',
+      autoDisableAfterFailures: 5,
+    });
+    await methods.reserveStartedRun(runData(schedule, { scheduledFor: generating }));
+
+    const all = await methods.getActiveRunsForUser(schedule.user);
+    const started = await methods.getActiveRunsForUser(schedule.user, ['started']);
+
+    expect(all.map((run) => run.status).sort()).toEqual(['requires_action', 'started']);
+    expect(started.map((run) => run.scheduledFor)).toEqual([generating]);
+  });
+
   it('reports a recorded null apart from a field that was never written', async () => {
     const schedule = await methods.createSchedule(scheduleData());
     const scoped = new Date('2026-07-20T12:00:00Z');
@@ -443,6 +463,29 @@ describe('createScheduleWithSlot (atomic per-user cap)', () => {
 });
 
 describe('recordRunOutcome', () => {
+  it('persists the paused namespace and preserves it when recovery has no namespace projection', async () => {
+    const schedule = await Schedule.create(scheduleData());
+    const row = await ScheduleRun.create(runData(schedule, { conversationId: 'paused-thread' }));
+    const outcome = {
+      scheduleId: schedule.id,
+      scheduledFor: row.scheduledFor,
+      status: 'requires_action' as const,
+      conversationId: 'paused-thread',
+      autoDisableAfterFailures: 3,
+    };
+    await methods.recordRunOutcome({ ...outcome, checkpointNamespace: 'owned-namespace' });
+    await methods.recordRunOutcome(outcome);
+    expect(await methods.getActiveRunsForSchedule(schedule.id)).toEqual([
+      expect.objectContaining({
+        status: 'requires_action',
+        checkpointNamespace: 'owned-namespace',
+      }),
+    ]);
+    expect(await ScheduleRun.findOne({ _id: row._id }).lean()).not.toHaveProperty(
+      'checkpointNamespace',
+    );
+  });
+
   const scheduledFor = new Date('2026-07-20T12:00:00Z');
 
   it('success finalizes the run, increments runCount, and resets failure state', async () => {
@@ -480,16 +523,19 @@ describe('recordRunOutcome', () => {
   it('error increments failureCount without disabling below the threshold', async () => {
     const schedule = await methods.createSchedule(scheduleData());
     await methods.insertScheduleRun(runData(schedule, { scheduledFor }));
+    const mcp = [{ server: 'Notion', status: 'mcp_unavailable' as const }];
     await methods.recordRunOutcome({
       scheduleId: schedule.id,
       scheduledFor,
       status: 'error',
       error: 'provider exploded',
+      mcp,
       autoDisableAfterFailures: 3,
     });
     const run = await getRun(schedule.id, scheduledFor);
     expect(run.status).toBe('error');
     expect(run.error).toBe('provider exploded');
+    expect(run.mcp).toEqual(mcp);
     const updated = await getSchedule(schedule.id);
     expect(updated.failureCount).toBe(1);
     expect(updated.runCount).toBe(0);
@@ -826,6 +872,31 @@ describe('countActiveRuns', () => {
       autoDisableAfterFailures: 3,
     });
     expect(await methods.countActiveRuns()).toBe(1);
+  });
+});
+
+describe('getCapacityOccupancy', () => {
+  it('excludes admission-only failures that never dispatched a generation', async () => {
+    const admission = await methods.createSchedule(scheduleData());
+    const legacy = await methods.createSchedule(scheduleData());
+    const slotted = await methods.createSchedule(scheduleData());
+    await methods.reserveStartedRun(
+      runData(admission, {
+        scheduledFor: new Date('2026-07-20T12:00:00Z'),
+        admissionOnly: true,
+      }),
+    );
+    await methods.reserveStartedRun(
+      runData(legacy, { scheduledFor: new Date('2026-07-20T13:00:00Z') }),
+    );
+    await methods.reserveStartedRun(
+      runData(slotted, { scheduledFor: new Date('2026-07-20T14:00:00Z'), capacitySlot: 2 }),
+    );
+
+    await expect(methods.getCapacityOccupancy()).resolves.toEqual({
+      takenSlots: [2],
+      unslotted: 1,
+    });
   });
 });
 
@@ -2969,4 +3040,316 @@ describe('erasure sweep rotation and idempotency-key lookup', () => {
       Schedule.create(scheduleData({ cadence: { frequency: 'daily' } as ISchedule['cadence'] })),
     ).rejects.toThrow(/hour/);
   });
+});
+
+describe('scheduled MCP tool failure receipt', () => {
+  it('records only the matching active run and preserves the backwards-compatible failure', async () => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const scheduledFor = new Date('2026-09-09T14:00:00Z');
+    await methods.insertScheduleRun(runData(schedule, { scheduledFor, conversationId: 'c1' }));
+    const input = { scheduleId: schedule.id, scheduledFor, conversationId: 'c1', server: 'Graph' };
+    expect(await methods.recordMCPToolAuthFailure({ ...input, conversationId: 'another' })).toBe(
+      false,
+    );
+    expect(await methods.recordMCPToolAuthFailure({ ...input, tenantId: 'other-tenant' })).toBe(
+      false,
+    );
+    expect(await methods.recordMCPToolAuthFailure(input)).toBe(true);
+    expect(await methods.recordMCPToolAuthFailure(input)).toBe(true);
+    const run = await methods.getScheduleRunAbortState(schedule.id, scheduledFor);
+    expect(run?.mcp).toEqual([
+      { server: 'Graph', status: 'mcp_configuration_missing', detail: 'unattended_auth_required' },
+    ]);
+    await methods.recordRunOutcome({
+      scheduleId: schedule.id,
+      scheduledFor,
+      status: 'error',
+      mcp: run!.mcp,
+      error: `mcp_configuration_missing: ${JSON.stringify(run!.mcp)}`,
+      autoDisableAfterFailures: 5,
+    });
+    const after = await getSchedule(schedule.id);
+    expect(after.enabled).toBe(false);
+    expect(after.disabledReason).toBe('mcp_configuration_missing');
+    expect(after.lastRun?.mcp).toEqual(run!.mcp);
+    expect(await methods.recordMCPToolAuthFailure(input)).toBe(false);
+  });
+});
+
+describe('scheduled MCP receipt settlement', () => {
+  const failure = {
+    server: 'Graph',
+    status: 'mcp_configuration_missing' as const,
+    detail: 'unattended_auth_required' as const,
+  };
+  const ready = { server: 'Graph', status: 'ready' as const };
+
+  it.each(['success', 'skipped_balance', 'error'] as const)(
+    'keeps a persisted receipt through post-enqueue writes and settles %s as a permanent failure',
+    async (status) => {
+      const schedule = await methods.createSchedule(scheduleData());
+      const scheduledFor = new Date('2026-09-09T15:00:00Z');
+      const input = {
+        scheduleId: schedule.id,
+        scheduledFor,
+        conversationId: 'c1',
+        server: 'Graph',
+      };
+      await methods.insertScheduleRun(
+        runData(schedule, {
+          scheduledFor,
+          conversationId: 'c1',
+          configRevision: schedule.configRevision,
+          mcp: [ready],
+        }),
+      );
+
+      expect(await methods.recordMCPToolAuthFailure(input)).toBe(true);
+      await methods.setRunFireDetails(schedule.id, scheduledFor, {
+        conversationId: 'c1',
+        mcp: [ready],
+        droppedFileIds: ['missing-file'],
+      });
+      expect((await getRun(schedule.id, scheduledFor)).mcp).toEqual([ready, failure]);
+
+      await methods.recordRunOutcome({
+        scheduleId: schedule.id,
+        scheduledFor,
+        status,
+        conversationId: 'c1',
+        ...(status === 'success' ? { mcp: [ready] } : {}),
+        ...(status === 'error' ? { error: 'Run ended in error' } : {}),
+        autoDisableAfterFailures: Number.MAX_SAFE_INTEGER,
+        balanceSkipDisableThreshold: 3,
+      });
+      const result = await getRun(schedule.id, scheduledFor);
+      const card = await getSchedule(schedule.id);
+      expect(result).toMatchObject({ status: 'error', bookkept: true, mcp: [ready, failure] });
+      expect(card.lastRun).toMatchObject({ status: 'error', mcp: [ready, failure] });
+      expect(card.enabled).toBe(false);
+      expect(card.disabledReason).toBe('mcp_configuration_missing');
+      expect(card.failureCount).toBe(1);
+      expect(card.balanceSkipCount).toBe(0);
+      expect(card.lastRun?.error).toBe(
+        status === 'error' ? 'Run ended in error' : 'MCP unattended authorization unavailable',
+      );
+      await methods.recordRunOutcome({
+        scheduleId: schedule.id,
+        scheduledFor,
+        status: 'success',
+        autoDisableAfterFailures: Number.MAX_SAFE_INTEGER,
+      });
+      expect((await getSchedule(schedule.id)).failureCount).toBe(1);
+      expect(await methods.recordMCPToolAuthFailure(input)).toBe(false);
+    },
+  );
+
+  it('lets the receipt and terminal settlement linearize in either order', async () => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const scheduledFor = new Date('2026-09-09T16:00:00Z');
+    await methods.insertScheduleRun(runData(schedule, { scheduledFor, conversationId: 'c1' }));
+    const [recorded] = await Promise.all([
+      methods.recordMCPToolAuthFailure({
+        scheduleId: schedule.id,
+        scheduledFor,
+        conversationId: 'c1',
+        server: 'Graph',
+      }),
+      methods.recordRunOutcome({
+        scheduleId: schedule.id,
+        scheduledFor,
+        status: 'success',
+        autoDisableAfterFailures: Number.MAX_SAFE_INTEGER,
+      }),
+    ]);
+    const run = await getRun(schedule.id, scheduledFor);
+    const card = await getSchedule(schedule.id);
+    expect(run.status).toBe(recorded ? 'error' : 'success');
+    expect(card.disabledReason).toBe(recorded ? 'mcp_configuration_missing' : undefined);
+    expect(card.lastRun?.status).toBe(run.status);
+  });
+
+  it('does not restore a cleared conversation ID from late fire bookkeeping', async () => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const scheduledFor = new Date('2026-09-09T17:00:00Z');
+    await methods.insertScheduleRun(runData(schedule, { scheduledFor, conversationId: 'c1' }));
+    await methods.recordRunOutcome({
+      scheduleId: schedule.id,
+      scheduledFor,
+      status: 'interrupted',
+      clearConversationId: true,
+      autoDisableAfterFailures: 5,
+    });
+    await methods.setRunFireDetails(schedule.id, scheduledFor, {
+      conversationId: 'c1',
+      mcp: [ready],
+    });
+    const result = await getRun(schedule.id, scheduledFor);
+    expect(result.conversationId).toBeUndefined();
+    expect(result.mcp).toBeUndefined();
+  });
+
+  it('fences an old receipt from disabling a schedule the owner has edited', async () => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const scheduledFor = new Date('2026-09-09T18:00:00Z');
+    await methods.insertScheduleRun(
+      runData(schedule, { scheduledFor, conversationId: 'c1', configRevision: 0 }),
+    );
+    await methods.recordMCPToolAuthFailure({
+      scheduleId: schedule.id,
+      scheduledFor,
+      conversationId: 'c1',
+      server: 'Graph',
+    });
+    await Schedule.updateOne({ id: schedule.id }, { $inc: { configRevision: 1 } });
+
+    await methods.recordRunOutcome({
+      scheduleId: schedule.id,
+      scheduledFor,
+      status: 'success',
+      autoDisableAfterFailures: 5,
+    });
+    expect((await getRun(schedule.id, scheduledFor)).status).toBe('error');
+    expect(await getSchedule(schedule.id)).toMatchObject({ enabled: true, failureCount: 0 });
+    expect((await getSchedule(schedule.id)).lastRun).toBeUndefined();
+  });
+
+  it('replays a receipt when schedule bookkeeping fails after the run terminalizes', async () => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const scheduledFor = new Date('2026-09-09T19:00:00Z');
+    await methods.insertScheduleRun(runData(schedule, { scheduledFor, conversationId: 'c1' }));
+    await methods.recordMCPToolAuthFailure({
+      scheduleId: schedule.id,
+      scheduledFor,
+      conversationId: 'c1',
+      server: 'Graph',
+    });
+    const firstWrite = jest
+      .spyOn(Schedule, 'updateOne')
+      .mockRejectedValueOnce(new Error('DB unavailable'));
+    await expect(
+      methods.recordRunOutcome({
+        scheduleId: schedule.id,
+        scheduledFor,
+        status: 'success',
+        autoDisableAfterFailures: Number.MAX_SAFE_INTEGER,
+      }),
+    ).rejects.toThrow('DB unavailable');
+    firstWrite.mockRestore();
+    const pending = await getRun(schedule.id, scheduledFor);
+    expect(pending).toMatchObject({ status: 'error', bookkept: false, mcp: [failure] });
+
+    const replay = {
+      scheduleId: schedule.id,
+      scheduledFor,
+      status: 'error' as const,
+      conversationId: 'c1',
+      error: pending.error,
+      mcp: pending.mcp,
+      autoDisableAfterFailures: Number.MAX_SAFE_INTEGER,
+    };
+    await methods.finalizeBookkeeping(replay);
+    await methods.finalizeBookkeeping(replay);
+    expect((await getRun(schedule.id, scheduledFor)).bookkept).toBe(true);
+    expect(await getSchedule(schedule.id)).toMatchObject({
+      enabled: false,
+      disabledReason: 'mcp_configuration_missing',
+      failureCount: 1,
+    });
+  });
+});
+
+describe('scheduled MCP failure policy', () => {
+  it.each([
+    'mcp_reauth_required',
+    'mcp_configuration_missing',
+    'mcp_permission_denied',
+    'mcp_unavailable',
+  ])('records %s and disables immediately only for user action', async (reason) => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const scheduledFor = new Date('2026-09-09T12:00:00Z');
+    await methods.insertScheduleRun(runData(schedule, { scheduledFor }));
+    await methods.recordRunOutcome({
+      scheduleId: schedule.id,
+      scheduledFor,
+      status: 'error',
+      error: `${reason}: [{"server":"Notion","status":"${reason}"}]`,
+      mcp: [{ server: 'Notion', agentId: 'research-agent', status: reason as never }],
+      autoDisableAfterFailures: 5,
+    });
+    const updated = await getSchedule(schedule.id);
+    expect(updated.failureCount).toBe(1);
+    expect(updated.enabled).toBe(reason === 'mcp_unavailable');
+    expect(updated.disabledReason).toBe(reason === 'mcp_unavailable' ? undefined : reason);
+    expect(updated.lastRun?.mcp?.[0]).toMatchObject({
+      server: 'Notion',
+      agentId: 'research-agent',
+      status: reason,
+    });
+  });
+
+  it('does not infer MCP disablement from an ordinary provider error prefix', async () => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const scheduledFor = new Date('2026-09-09T12:30:00Z');
+    await methods.insertScheduleRun(runData(schedule, { scheduledFor }));
+
+    await methods.recordRunOutcome({
+      scheduleId: schedule.id,
+      scheduledFor,
+      status: 'error',
+      error: 'mcp_configuration_missing: provider returned this text',
+      autoDisableAfterFailures: 5,
+    });
+
+    const updated = await getSchedule(schedule.id);
+    expect(updated.failureCount).toBe(1);
+    expect(updated.enabled).toBe(true);
+    expect(updated.disabledReason).toBeUndefined();
+  });
+
+  it('uses admission response precedence for mixed MCP failures', async () => {
+    const schedule = await methods.createSchedule(scheduleData());
+    const scheduledFor = new Date('2026-09-09T12:45:00Z');
+    await methods.insertScheduleRun(runData(schedule, { scheduledFor }));
+
+    await methods.recordRunOutcome({
+      scheduleId: schedule.id,
+      scheduledFor,
+      status: 'error',
+      error: 'mixed MCP failure',
+      mcp: [
+        { server: 'OAuth', status: 'mcp_reauth_required' },
+        { server: 'Private', status: 'mcp_permission_denied' },
+      ],
+      autoDisableAfterFailures: 5,
+    });
+
+    const updated = await getSchedule(schedule.id);
+    expect(updated.enabled).toBe(false);
+    expect(updated.disabledReason).toBe('mcp_permission_denied');
+  });
+});
+
+it('does not apply a late MCP disable after a newer successful occurrence', async () => {
+  const schedule = await methods.createSchedule(scheduleData());
+  const older = new Date('2026-09-09T12:00:00Z');
+  const newer = new Date('2026-09-09T13:00:00Z');
+  await methods.insertScheduleRun(
+    runData(schedule, { scheduledFor: older, status: 'requires_action' }),
+  );
+  await methods.insertScheduleRun(runData(schedule, { scheduledFor: newer }));
+  await methods.recordRunOutcome({
+    scheduleId: schedule.id,
+    scheduledFor: newer,
+    status: 'success',
+    autoDisableAfterFailures: 5,
+  });
+  await methods.recordRunOutcome({
+    scheduleId: schedule.id,
+    scheduledFor: older,
+    status: 'error',
+    error: 'mcp_reauth_required: [{"server":"Notion","status":"mcp_reauth_required"}]',
+    autoDisableAfterFailures: 5,
+  });
+  expect((await getSchedule(schedule.id)).enabled).toBe(true);
 });
